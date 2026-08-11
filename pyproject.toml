@@ -1,0 +1,25 @@
+[project]
+name = "fp-processing"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Ben Barnhart", email = "brbarnhart99@gmail.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "matplotlib>=3.10.9",
+    "polars>=1.43.2",
+    "pyarrow>=25.0.1",
+    "seaborn>=0.13.2",
+    "tdt>=0.7.5",
+]
+
+[build-system]
+requires = ["uv_build>=0.10.11,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+]
