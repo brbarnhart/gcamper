@@ -1,7 +1,7 @@
 [project]
-name = "fp-processing"
+name = "gcamper"
 version = "0.1.0"
-description = "Add your description here"
+description = "Fiber photometry analysis toolkit (TDT-first)"
 readme = "README.md"
 authors = [
     { name = "Ben Barnhart", email = "brbarnhart99@gmail.com" }
