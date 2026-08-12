@@ -268,6 +268,7 @@ def create_master_df(
 
         if debug:
             print(f"Shape: {_data.shape}")
+            print(f"Columns: {_data.columns}")
 
         df_list.append(_data)
 
@@ -360,7 +361,9 @@ def get_session_events(
         return events
 
     if by:
-        return events.with_columns(pl.int_range(0, pl.len()).over(by).cast(pl.UInt32).alias("event_id"))
+        return events.with_columns(
+            pl.int_range(0, pl.len()).over(by).cast(pl.UInt32).alias("event_id")
+        )
     return events.with_row_index("event_id")
 
 
@@ -616,9 +619,7 @@ def extract_event_windows(
             group_events = group_events.filter(pl.col(c) == v)
         # Drop by-cols from the per-group events table; they are re-attached
         # from group_keys so we don't duplicate after concat.
-        event_cols = [
-            c for c in group_events.columns if c not in by
-        ]
+        event_cols = [c for c in group_events.columns if c not in by]
         group_events = group_events.select(event_cols)
 
         windows = _extract_event_windows_one(
@@ -635,9 +636,7 @@ def extract_event_windows(
             continue
 
         attach = {**group_keys, **{c: group[c][0] for c in carry_cols}}
-        windows = windows.with_columns(
-            [pl.lit(v).alias(k) for k, v in attach.items()]
-        )
+        windows = windows.with_columns([pl.lit(v).alias(k) for k, v in attach.items()])
         # Prefer group keys / metadata near the front for readability.
         front = [*by, *carry_cols]
         other = [c for c in windows.columns if c not in front]
