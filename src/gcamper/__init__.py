@@ -1,3 +1,4 @@
+from .bleach import bleach_correct, bleach_correct_df, fit_bleach_curve
 from .core import (
     average_event_windows,
     create_generic_stream,
@@ -8,20 +9,37 @@ from .core import (
     extract_event_windows,
     get_file_metadata,
     get_session_events,
+    isosbestic_fit,
     regression_based_dff,
     z_score_event_windows,
 )
+from .plots import (
+    annotate_events,
+    plot_isosbestic_diagnostics,
+    plot_isosbestic_fit,
+    plot_isosbestic_scatter,
+    plot_raw_traces,
+)
 
 __all__ = [
+    "annotate_events",
     "average_event_windows",
+    "bleach_correct",
+    "bleach_correct_df",
     "create_generic_stream",
     "create_master_df",
     "create_session_df",
     "create_time_array",
     "create_time_stream",
     "extract_event_windows",
+    "fit_bleach_curve",
     "get_file_metadata",
     "get_session_events",
+    "isosbestic_fit",
+    "plot_isosbestic_diagnostics",
+    "plot_isosbestic_fit",
+    "plot_isosbestic_scatter",
+    "plot_raw_traces",
     "regression_based_dff",
     "z_score_event_windows",
 ]

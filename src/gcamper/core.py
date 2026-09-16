@@ -277,6 +277,37 @@ def create_master_df(
     return master_df
 
 
+def isosbestic_fit(isos: np.ndarray, gcamp: np.ndarray) -> np.ndarray:
+    """Linear isosbestic estimate of GCaMP: ``Y_fit = a * isos + b``.
+
+    Fit on a single continuous recording (or a well-defined epoch), not on
+    a multi-session master table as if it were one time series.
+
+    Parameters
+    ----------
+    isos:
+        1-D isosbestic / control fluorescence.
+    gcamp:
+        1-D functional fluorescence, same length as ``isos``.
+
+    Returns
+    -------
+    np.ndarray
+        1-D fitted GCaMP estimate, same length as the inputs.
+    """
+    isos = np.asarray(isos)
+    gcamp = np.asarray(gcamp)
+    if isos.shape != gcamp.shape:
+        raise ValueError(
+            "isos and gcamp must have the same shape "
+            f"(got {isos.shape} and {gcamp.shape})"
+        )
+    if isos.size < 2:
+        raise ValueError("isos and gcamp must contain at least two samples")
+    bls = np.polyfit(isos, gcamp, 1)
+    return np.polyval(bls, isos)
+
+
 def regression_based_dff(isos: np.ndarray, gcamp: np.ndarray) -> np.ndarray:
     """Compute regression-based ΔF/F from isosbestic and GCaMP traces.
 
@@ -301,10 +332,8 @@ def regression_based_dff(isos: np.ndarray, gcamp: np.ndarray) -> np.ndarray:
     np.ndarray
         1-D ``float32`` ΔF/F in percent, same length as the inputs.
     """
-    bls = np.polyfit(isos, gcamp, 1)
-    Y_fit_all = np.polyval(bls, isos)
-    Y_dF_all = gcamp - Y_fit_all
-    dFF = (100 * Y_dF_all / Y_fit_all).astype(np.float32)
+    y_fit = isosbestic_fit(isos, gcamp)
+    dFF = (100 * (gcamp - y_fit) / y_fit).astype(np.float32)
 
     return dFF
 
