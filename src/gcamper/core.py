@@ -138,12 +138,31 @@ def create_time_stream(tank: tdt.StructType, ref_stream: str) -> tdt.StructType:
     return time_stream
 
 
+def _tdt_store_ids(*names: str) -> list[str]:
+    """Map Python stream names to ids accepted by ``tdt.read_block(store=...)``.
+
+    ``read_block`` filters on the raw 4-character store id. ``tdt.fix_var_name``
+    inserts a leading underscore when that id starts with a digit, so callers
+    pass ``"_405A"`` for a store named ``405A``. Both forms are returned.
+    """
+    store_ids: list[str] = []
+    for name in names:
+        if name not in store_ids:
+            store_ids.append(name)
+        if len(name) == 5 and name.startswith("_") and name[1].isdigit():
+            raw_id = name[1:]
+            if raw_id not in store_ids:
+                store_ids.append(raw_id)
+    return store_ids
+
+
 def create_session_df(
     file: Path, metadata_fields: list[str], isos: str, gcamp: str
 ) -> pl.DataFrame:
     """Load one TDT block into a tidy photometry session dataframe.
 
-    Reads isosbestic and GCaMP streams, builds a ``time`` column, attaches
+    Reads the isosbestic stream, the GCaMP stream, and the ``Note`` epoc
+    (other tank stores are skipped), builds a ``time`` column, attaches
     filename metadata, and left-joins Note epocs (if present) onto the nearest
     sample via ``join_asof``. Notes are sparse: only rows near note onsets
     have non-null ``Note`` / ``Onset`` / ``Offset``.
@@ -167,7 +186,7 @@ def create_session_df(
         ``time``, ``duration``, and note columns (``Note``, ``Onset``,
         ``Offset``; null-filled if the block has no Note epocs).
     """
-    data = tdt.read_block(file)
+    data = tdt.read_block(file, store=_tdt_store_ids(isos, gcamp, "Note"))
     data.streams.time = create_time_stream(data, isos)
 
     metadata = get_file_metadata(file, metadata_fields)
