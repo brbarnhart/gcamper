@@ -157,18 +157,84 @@ def _tdt_store_ids(*names: str) -> list[str]:
     return store_ids
 
 
+# Synapse records these digital inputs with a trailing slash. ``tdt`` then
+# exposes them as ``PC0_`` and ``PC1_`` because ``/`` is not a valid attribute.
+_EPOC_RAW_ALIASES = {"PC0_": "PC0/", "PC1_": "PC1/"}
+_EVENT_CANDIDATES = ("Note", "PC0/", "PC1/")
+
+
+def _resolve_epoc_store(name: str) -> tuple[str, str]:
+    """Return ``(raw_store_id, python_attribute_name)`` for an epoc name."""
+    raw = _EPOC_RAW_ALIASES.get(name, name)
+    if len(raw) == 5 and raw.startswith("_") and raw[1].isdigit():
+        raw = raw[1:]
+    return raw, tdt.fix_var_name(raw)
+
+
+def _event_table_from_epoc(
+    epoc: tdt.StructType,
+    store_name: str,
+    label: str | None,
+) -> pl.DataFrame | None:
+    """Build the sparse ``Note`` / ``Onset`` / ``Offset`` table for one epoc.
+
+    A non-empty ``label`` is used for every event. Otherwise the epoc's own
+    note text is kept when it has one entry per onset. A port epoc has no
+    text, so the store name is used instead.
+    """
+    onset = np.atleast_1d(np.asarray(getattr(epoc, "onset", []), dtype=float))
+    if onset.size == 0:
+        return None
+
+    offset = getattr(epoc, "offset", None)
+    if offset is None:
+        offset_values = np.full(onset.shape, np.nan)
+    else:
+        offset_values = np.atleast_1d(np.asarray(offset, dtype=float))
+        if offset_values.shape[0] != onset.shape[0]:
+            offset_values = np.full(onset.shape, np.nan)
+
+    text = (label or "").strip()
+    if text:
+        notes = np.full(onset.shape, text)
+    else:
+        raw_notes = getattr(epoc, "notes", None)
+        if raw_notes is None:
+            notes = np.full(onset.shape, store_name)
+        else:
+            raw_notes = np.atleast_1d(np.asarray(raw_notes))
+            if raw_notes.shape[0] == onset.shape[0]:
+                notes = raw_notes.astype(str)
+            else:
+                notes = np.full(onset.shape, store_name)
+
+    return pl.DataFrame(
+        {"Note": notes, "Onset": onset, "Offset": offset_values}
+    ).sort("Onset")
+
+
 def create_session_df(
-    file: Path, metadata_fields: list[str], isos: str, gcamp: str
+    file: Path,
+    metadata_fields: list[str],
+    isos: str,
+    gcamp: str,
+    event_store: str | None = None,
+    event_label: str | None = None,
 ) -> pl.DataFrame:
     """Load one TDT block into a tidy photometry session dataframe.
 
-    Reads the isosbestic stream, the GCaMP stream, and the ``Note`` epoc
-    (other tank stores are skipped), builds a ``time`` column, attaches
-    filename metadata, and left-joins Note epocs (if present) onto the nearest
-    sample via ``join_asof``. Metadata columns (``metadata_fields`` plus
-    ``Extra``) are stored as categoricals: one code per row, with the label
-    kept once. Notes are sparse: only rows near note onsets have non-null
-    ``Note`` / ``Onset`` / ``Offset``.
+    Reads the isosbestic stream, the GCaMP stream, and one epoc (other tank
+    stores are skipped), builds a ``time`` column, attaches filename metadata,
+    and left-joins that epoc's events onto the nearest sample via
+    ``join_asof``. Metadata columns (``metadata_fields`` plus ``Extra``) are
+    stored as categoricals: one code per row, with the label kept once.
+    Events are sparse: only rows near onsets have non-null ``Note`` /
+    ``Onset`` / ``Offset``.
+
+    ``event_store`` selects the epoc. ``None`` reads ``Note``. ``PC0_`` and
+    ``PC0/`` are the same digital-input store, and likewise for ``PC1_``.
+    ``event_label``, when set, replaces the event text. A port epoc has no
+    note text of its own, so with no label the store name is used.
 
     Parameters
     ----------
@@ -181,15 +247,22 @@ def create_session_df(
         TDT stream name for the isosbestic / control channel (e.g. ``"_405A"``).
     gcamp:
         TDT stream name for the functional channel (e.g. ``"_465A"``).
+    event_store:
+        Epoc to join as the event column. ``None`` uses ``Note``.
+    event_label:
+        Text written into ``Note`` for every event from ``event_store``.
+        ``None`` keeps the epoc's own note text, or the store name when the
+        epoc has none.
 
     Returns
     -------
     pl.DataFrame
         Sorted by ``time``, with categorical metadata columns, ``isos``,
         ``gcamp``, ``time``, ``duration``, and note columns (``Note``,
-        ``Onset``, ``Offset``; null-filled if the block has no Note epocs).
+        ``Onset``, ``Offset``; null-filled if the chosen epoc has no events).
     """
-    data = tdt.read_block(file, store=_tdt_store_ids(isos, gcamp, "Note"))
+    raw_store, epoc_attr = _resolve_epoc_store(event_store or "Note")
+    data = tdt.read_block(file, store=_tdt_store_ids(isos, gcamp, raw_store))
     data.streams.time = create_time_stream(data, isos)
 
     metadata = get_file_metadata(file, metadata_fields)
@@ -213,37 +286,26 @@ def create_session_df(
         .sort("time")
     )
 
-    if hasattr(data.epocs, "Note"):
-        notes_df = pl.DataFrame(
-            {
-                "Note": data.epocs.Note.notes,
-                "Onset": data.epocs.Note.onset,
-                "Offset": data.epocs.Note.offset,
-            }
-        ).sort("Onset")
-
-        notes_df = notes_df.join_asof(
+    epoc = data.epocs[epoc_attr] if epoc_attr in data.epocs.keys() else None
+    events = (
+        None
+        if epoc is None
+        else _event_table_from_epoc(epoc, event_store or "Note", event_label)
+    )
+    if events is None:
+        final_df = data_df.with_columns(
+            pl.lit(None).cast(pl.String).alias("Note"),
+            pl.lit(None).cast(pl.Float64).alias("Onset"),
+            pl.lit(None).cast(pl.Float64).alias("Offset"),
+        )
+    else:
+        events = events.join_asof(
             data_df.select("time"),
             left_on="Onset",
             right_on="time",
             strategy="nearest",
         )
-
-        final_df = data_df.join(
-            notes_df,
-            on="time",
-            how="left",
-        )
-    else:
-        notes_df = {
-            "Note": pl.String,
-            "Onset": pl.Float64,
-            "Offset": pl.Float64,
-        }
-
-        final_df = data_df.with_columns(
-            [pl.lit(None).cast(dtype).alias(name) for name, dtype in notes_df.items()]
-        )
+        final_df = data_df.join(events, on="time", how="left")
 
     return final_df
 
@@ -344,6 +406,199 @@ def _downsample_to_sample_rate(df: pl.DataFrame, sample_rate: float) -> pl.DataF
     return binned.join(snapped, on=sort_keys, how="left")
 
 
+def _epoc_event_counts(path: Path, candidates: Sequence[str]) -> dict[str, int]:
+    """Count onsets for each candidate epoc without reading photometry streams."""
+    raw_ids = [_resolve_epoc_store(name)[0] for name in candidates]
+    data = tdt.read_block(path, store=raw_ids)
+    counts: dict[str, int] = {}
+    for name in candidates:
+        attr = _resolve_epoc_store(name)[1]
+        if attr not in data.epocs.keys():
+            counts[name] = 0
+            continue
+        onset = np.atleast_1d(np.asarray(data.epocs[attr].onset, dtype=float))
+        counts[name] = int(onset.size)
+    return counts
+
+
+def _choose_event_store(counts: dict[str, int], previous: str) -> str:
+    """Keep a store that was already chosen. Otherwise fill in an unambiguous one."""
+    if previous.strip():
+        return previous.strip()
+    present = [name for name, count in counts.items() if count > 0]
+    if len(present) == 1:
+        return present[0]
+    return ""
+
+
+def _merge_event_table(
+    scanned: list[dict[str, object]],
+    existing: pl.DataFrame | None,
+    candidates: Sequence[str],
+) -> pl.DataFrame:
+    """Refresh counts, keep prior ``store`` and ``label`` choices, append new files."""
+    previous: dict[str, tuple[str, str]] = {}
+    leftovers: list[dict[str, object]] = []
+    if existing is not None:
+        seen: set[str] = set()
+        for row in existing.iter_rows(named=True):
+            stem = Path(str(row["file"])).stem
+            if stem in seen:
+                raise ValueError(f"events table lists {stem!r} more than once")
+            seen.add(stem)
+            previous[stem] = (
+                "" if row["store"] is None else str(row["store"]).strip(),
+                "" if row["label"] is None else str(row["label"]).strip(),
+            )
+        scanned_stems = {str(row["file"]) for row in scanned}
+        for row in existing.iter_rows(named=True):
+            stem = Path(str(row["file"])).stem
+            if stem not in scanned_stems:
+                kept_counts = {
+                    name: 0 if row[name] is None else int(row[name])
+                    for name in candidates
+                }
+                leftovers.append(
+                    {
+                        "file": stem,
+                        **kept_counts,
+                        "store": previous[stem][0],
+                        "label": previous[stem][1],
+                    }
+                )
+
+    rows: list[dict[str, object]] = []
+    for row in scanned:
+        stem = str(row["file"])
+        counts = {name: int(row[name]) for name in candidates}
+        old_store, old_label = previous.get(stem, ("", ""))
+        rows.append(
+            {
+                "file": stem,
+                **counts,
+                "store": _choose_event_store(counts, old_store),
+                "label": old_label,
+            }
+        )
+    rows.extend(leftovers)
+    return pl.DataFrame(
+        rows,
+        schema={
+            "file": pl.String,
+            **{name: pl.Int64 for name in candidates},
+            "store": pl.String,
+            "label": pl.String,
+        },
+    )
+
+
+def write_events_csv(
+    data_files: list[Path],
+    path: str | Path,
+    candidates: Sequence[str] = _EVENT_CANDIDATES,
+) -> pl.DataFrame:
+    """Write an event-source sheet for ``create_master_df(..., events=path)``.
+
+    Each row is one block folder. The count columns are how many onsets
+    ``Note``, ``PC0/``, and ``PC1/`` contain. ``store`` is filled in when
+    exactly one of those counts is non-zero. It is left blank when none or
+    several have events, which is the case to edit by hand. ``label`` is
+    optional text used for a port's events in place of the store name.
+
+    Running this again refreshes the counts and adds new folders. A ``store``
+    or ``label`` that already has text is left as written. Clear ``store``
+    before re-running if that row should be chosen automatically again.
+    Rows for folders not in ``data_files`` are kept.
+
+    Parameters
+    ----------
+    data_files:
+        TDT block directories to scan.
+    path:
+        CSV path to write. An existing file at this path is updated.
+    candidates:
+        Epoc names to count. The default is ``Note``, ``PC0/``, and ``PC1/``.
+        ``PC0_`` and ``PC1_`` name the same stores.
+
+    Returns
+    -------
+    pl.DataFrame
+        The table that was written.
+    """
+    candidates = tuple(candidates)
+    if not candidates:
+        raise ValueError("candidates must name at least one epoc")
+    stems = [file.stem for file in data_files]
+    duplicates = sorted({stem for stem in stems if stems.count(stem) > 1})
+    if duplicates:
+        raise ValueError(f"data_files has repeated folder names: {duplicates}")
+
+    destination = Path(path)
+    existing = None
+    if destination.exists():
+        existing = pl.read_csv(
+            destination,
+            schema_overrides={
+                "file": pl.String,
+                "store": pl.String,
+                "label": pl.String,
+                **{name: pl.Int64 for name in candidates},
+            },
+        )
+        missing = {"file", "store", "label", *candidates} - set(existing.columns)
+        if missing:
+            raise ValueError(
+                f"{destination} is missing columns: {sorted(missing)}"
+            )
+
+    scanned: list[dict[str, object]] = []
+    for file in data_files:
+        counts = _epoc_event_counts(file, candidates)
+        scanned.append({"file": file.stem, **counts})
+
+    table = _merge_event_table(scanned, existing, candidates)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    table.write_csv(destination)
+    return table
+
+
+def _load_events_table(
+    path: str | Path,
+    data_files: list[Path],
+) -> dict[str, tuple[str | None, str | None]]:
+    """Map a block folder name to ``(event_store, event_label)`` from a CSV."""
+    destination = Path(path)
+    if not destination.exists():
+        raise FileNotFoundError(f"events table not found: {destination}")
+    table = pl.read_csv(
+        destination,
+        schema_overrides={"file": pl.String, "store": pl.String, "label": pl.String},
+    )
+    missing = {"file", "store", "label"} - set(table.columns)
+    if missing:
+        raise ValueError(f"{destination} is missing columns: {sorted(missing)}")
+
+    chosen: dict[str, tuple[str | None, str | None]] = {}
+    for row in table.iter_rows(named=True):
+        stem = Path(str(row["file"])).stem
+        if stem in chosen:
+            raise ValueError(f"events table lists {stem!r} more than once")
+        store = "" if row["store"] is None else str(row["store"]).strip()
+        label = "" if row["label"] is None else str(row["label"]).strip()
+        chosen[stem] = (store or None, label or None)
+
+    file_stems = [file.stem for file in data_files]
+    repeated = sorted({stem for stem in file_stems if file_stems.count(stem) > 1})
+    if repeated:
+        raise ValueError(f"data_files has repeated folder names: {repeated}")
+    absent = [stem for stem in file_stems if stem not in chosen]
+    if absent:
+        raise ValueError(
+            f"events table {destination} has no row for: {absent}"
+        )
+    return chosen
+
+
 def _load_session_frame(
     file: Path,
     metadata_fields: list[str],
@@ -352,12 +607,21 @@ def _load_session_frame(
     experiment_length: pl.Expr | None,
     sample_rate: float | None,
     debug: bool,
+    event_store: str | None = None,
+    event_label: str | None = None,
 ) -> pl.DataFrame:
     """Load one block, then apply the length filter and optional downsample."""
     if debug:
         print(file.name)
 
-    frame = create_session_df(file, metadata_fields, isos=isos, gcamp=gcamp)
+    frame = create_session_df(
+        file,
+        metadata_fields,
+        isos=isos,
+        gcamp=gcamp,
+        event_store=event_store,
+        event_label=event_label,
+    )
 
     if experiment_length is not None:
         frame = frame.filter(pl.col("duration") <= experiment_length)
@@ -384,6 +648,7 @@ def create_master_df(
     sample_rate: float | None = None,
     n_workers: int = 1,
     debug: bool = False,
+    events: str | Path | None = None,
 ) -> pl.DataFrame:
     """Stack multiple TDT sessions into one multi-recording dataframe.
 
@@ -417,6 +682,12 @@ def create_master_df(
         from different files can interleave.
     debug:
         If True, print each file name and its session shape while loading.
+    events:
+        Optional CSV from ``write_events_csv``. Each block folder is matched
+        on its name. A blank ``store`` reads ``Note``. A filled ``store``
+        (``Note``, ``PC0/``, ``PC1_``, and so on) is the epoc joined for that
+        file, and a filled ``label`` replaces that epoc's event text. Omit
+        to read ``Note`` for every file.
 
     Returns
     -------
@@ -427,7 +698,14 @@ def create_master_df(
     if n_workers < 1:
         raise ValueError(f"n_workers must be at least 1, got {n_workers}")
 
+    event_map = (
+        None if events is None else _load_events_table(events, data_files)
+    )
+
     def load(file: Path) -> pl.DataFrame:
+        event_store, event_label = (
+            (None, None) if event_map is None else event_map[file.stem]
+        )
         return _load_session_frame(
             file,
             metadata_fields,
@@ -436,6 +714,8 @@ def create_master_df(
             experiment_length,
             sample_rate,
             debug,
+            event_store,
+            event_label,
         )
 
     if n_workers == 1 or len(data_files) < 2:

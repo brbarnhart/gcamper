@@ -7,8 +7,15 @@ import pytest
 from gcamper import create_master_df
 
 
-def _fake_session(file: Path, metadata_fields, isos, gcamp) -> pl.DataFrame:
-    del metadata_fields, isos, gcamp
+def _fake_session(
+    file: Path,
+    metadata_fields,
+    isos,
+    gcamp,
+    event_store=None,
+    event_label=None,
+) -> pl.DataFrame:
+    del metadata_fields, isos, gcamp, event_store, event_label
     animal = file.name
     height = 20
     time = (np.arange(height, dtype=np.float64) / 100.0).astype(np.float32)

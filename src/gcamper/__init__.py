@@ -11,6 +11,7 @@ from .core import (
     get_session_events,
     isosbestic_fit,
     regression_based_dff,
+    write_events_csv,
     z_score_event_windows,
 )
 from .plots import (
@@ -41,5 +42,6 @@ __all__ = [
     "plot_isosbestic_scatter",
     "plot_raw_traces",
     "regression_based_dff",
+    "write_events_csv",
     "z_score_event_windows",
 ]
