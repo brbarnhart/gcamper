@@ -247,12 +247,109 @@ def create_session_df(
     return final_df
 
 
+_TRACE_COLS = ("isos", "gcamp", "time", "duration", "Note", "Onset", "Offset")
+
+
+def _downsample_to_sample_rate(df: pl.DataFrame, sample_rate: float) -> pl.DataFrame:
+    """Average recordings into bins of width ``1 / sample_rate`` seconds.
+
+    ``isos`` and ``gcamp`` become the mean of the samples in each bin, and
+    ``time`` becomes the mean of those sample times. ``duration`` is rebuilt
+    from that time. Each note is moved onto the nearest output sample. A
+    target at the recording rate returns ``df`` unchanged. A higher target
+    raises ``ValueError``. So does a target coarse enough that two notes
+    would share one output sample, which would duplicate rows in the trace.
+    """
+    if not np.isfinite(sample_rate) or sample_rate <= 0:
+        raise ValueError(
+            f"sample_rate must be a positive number of Hz, got {sample_rate}"
+        )
+    if df.height < 2:
+        return df
+
+    dt = df.select(pl.col("time").diff().drop_nulls().median()).item()
+    if dt is None or not np.isfinite(dt) or dt <= 0:
+        raise ValueError(
+            f"could not estimate a positive sampling interval (got {dt})"
+        )
+    native = 1.0 / float(dt)
+    if sample_rate > native * (1 + 1e-3):
+        raise ValueError(
+            f"sample_rate ({sample_rate:g} Hz) is above the recording rate "
+            f"({native:.4g} Hz)"
+        )
+    if sample_rate >= native * (1 - 1e-3):
+        return df
+
+    group_cols = [col for col in df.columns if col not in _TRACE_COLS]
+    df = df.sort([*group_cols, "time"] if group_cols else ["time"])
+    # Bin by sample index within each recording. ``time`` is float32, so
+    # flooring ``time * sample_rate`` puts edge samples in the wrong bin.
+    index = pl.int_range(pl.len())
+    span = pl.col("time").max() - pl.col("time").min()
+    count = pl.len()
+    if group_cols:
+        index = index.over(group_cols)
+        span = span.over(group_cols)
+        count = count.over(group_cols)
+    binned = (
+        df.with_columns(
+            _bin=(index.cast(pl.Float64) * sample_rate / ((count - 1) / span))
+            .floor()
+            .cast(pl.Int64)
+        )
+        .group_by(*group_cols, "_bin", maintain_order=True)
+        .agg(
+            pl.col("isos").mean().cast(pl.Float32),
+            pl.col("gcamp").mean().cast(pl.Float32),
+            pl.col("time").mean().cast(pl.Float32),
+        )
+        .drop("_bin")
+        .with_columns(pl.duration(seconds=pl.col("time")).alias("duration"))
+        .select(*group_cols, "isos", "gcamp", "time", "duration")
+    )
+
+    notes = df.filter(pl.col("Note").is_not_null()).select(
+        *group_cols, "Note", "Onset", "Offset"
+    )
+    if notes.is_empty():
+        return binned.with_columns(
+            pl.lit(None).cast(pl.String).alias("Note"),
+            pl.lit(None).cast(pl.Float64).alias("Onset"),
+            pl.lit(None).cast(pl.Float64).alias("Offset"),
+        )
+
+    sort_keys = [*group_cols, "time"]
+    binned = binned.sort(sort_keys)
+    asof_by = {"by": group_cols} if group_cols else {}
+    snapped = notes.sort([*group_cols, "Onset"]).join_asof(
+        binned.select(*sort_keys),
+        left_on="Onset",
+        right_on="time",
+        strategy="nearest",
+        check_sortedness=False,
+        **asof_by,
+    )
+    clash = (
+        snapped.group_by(sort_keys)
+        .agg(pl.len().alias("n"))
+        .filter(pl.col("n") > 1)
+    )
+    if clash.height:
+        raise ValueError(
+            "sample_rate is too coarse to keep every note on its own sample "
+            f"({clash.height} output sample(s) are nearest for more than one note)"
+        )
+    return binned.join(snapped, on=sort_keys, how="left")
+
+
 def create_master_df(
     data_files: list[Path],
     metadata_fields: list[str],
     isos: str,
     gcamp: str,
     experiment_length: pl.Expr | None = None,
+    sample_rate: float | None = None,
     debug: bool = False,
 ) -> pl.DataFrame:
     """Stack multiple TDT sessions into one multi-recording dataframe.
@@ -274,6 +371,11 @@ def create_master_df(
         Optional Polars expression compared against ``duration``. Rows with
         ``duration`` greater than this value are dropped per session before
         concat (e.g. ``pl.duration(minutes=20)``).
+    sample_rate:
+        Optional target sample rate in Hz. After the length filter, each
+        session is averaged into bins of width ``1 / sample_rate``. ``time``
+        is the mean time of the samples in the bin, and each note is snapped
+        to the nearest output sample. Omit to keep the acquisition rate.
     debug:
         If True, print each file name and its session shape while loading.
 
@@ -292,6 +394,12 @@ def create_master_df(
 
         if experiment_length is not None:
             _data = _data.filter(pl.col("duration") <= experiment_length)
+
+        if sample_rate is not None:
+            try:
+                _data = _downsample_to_sample_rate(_data, sample_rate)
+            except ValueError as exc:
+                raise ValueError(f"{file.name}: {exc}") from exc
 
         if debug:
             print(f"Shape: {_data.shape}")
