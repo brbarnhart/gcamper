@@ -164,8 +164,10 @@ def create_session_df(
     Reads the isosbestic stream, the GCaMP stream, and the ``Note`` epoc
     (other tank stores are skipped), builds a ``time`` column, attaches
     filename metadata, and left-joins Note epocs (if present) onto the nearest
-    sample via ``join_asof``. Notes are sparse: only rows near note onsets
-    have non-null ``Note`` / ``Onset`` / ``Offset``.
+    sample via ``join_asof``. Metadata columns (``metadata_fields`` plus
+    ``Extra``) are stored as categoricals: one code per row, with the label
+    kept once. Notes are sparse: only rows near note onsets have non-null
+    ``Note`` / ``Onset`` / ``Offset``.
 
     Parameters
     ----------
@@ -182,9 +184,9 @@ def create_session_df(
     Returns
     -------
     pl.DataFrame
-        Sorted by ``time``, with metadata columns, ``isos``, ``gcamp``,
-        ``time``, ``duration``, and note columns (``Note``, ``Onset``,
-        ``Offset``; null-filled if the block has no Note epocs).
+        Sorted by ``time``, with categorical metadata columns, ``isos``,
+        ``gcamp``, ``time``, ``duration``, and note columns (``Note``,
+        ``Onset``, ``Offset``; null-filled if the block has no Note epocs).
     """
     data = tdt.read_block(file, store=_tdt_store_ids(isos, gcamp, "Note"))
     data.streams.time = create_time_stream(data, isos)
@@ -194,13 +196,19 @@ def create_session_df(
     data_df = (
         pl.DataFrame(
             {
-                **metadata,
                 "isos": data.streams[isos].data,
                 "gcamp": data.streams[gcamp].data,
                 "time": data.streams.time.data,
             }
         )
-        .with_columns(pl.duration(seconds=pl.col("time")).alias("duration"))
+        .with_columns(
+            pl.duration(seconds=pl.col("time")).alias("duration"),
+            *[
+                pl.lit(value).cast(pl.Categorical).alias(name)
+                for name, value in metadata.items()
+            ],
+        )
+        .select(*metadata.keys(), "isos", "gcamp", "time", "duration")
         .sort("time")
     )
 
