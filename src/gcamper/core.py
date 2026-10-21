@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -343,6 +344,37 @@ def _downsample_to_sample_rate(df: pl.DataFrame, sample_rate: float) -> pl.DataF
     return binned.join(snapped, on=sort_keys, how="left")
 
 
+def _load_session_frame(
+    file: Path,
+    metadata_fields: list[str],
+    isos: str,
+    gcamp: str,
+    experiment_length: pl.Expr | None,
+    sample_rate: float | None,
+    debug: bool,
+) -> pl.DataFrame:
+    """Load one block, then apply the length filter and optional downsample."""
+    if debug:
+        print(file.name)
+
+    frame = create_session_df(file, metadata_fields, isos=isos, gcamp=gcamp)
+
+    if experiment_length is not None:
+        frame = frame.filter(pl.col("duration") <= experiment_length)
+
+    if sample_rate is not None:
+        try:
+            frame = _downsample_to_sample_rate(frame, sample_rate)
+        except ValueError as exc:
+            raise ValueError(f"{file.name}: {exc}") from exc
+
+    if debug:
+        print(f"Shape: {frame.shape}")
+        print(f"Columns: {frame.columns}")
+
+    return frame
+
+
 def create_master_df(
     data_files: list[Path],
     metadata_fields: list[str],
@@ -350,6 +382,7 @@ def create_master_df(
     gcamp: str,
     experiment_length: pl.Expr | None = None,
     sample_rate: float | None = None,
+    n_workers: int = 1,
     debug: bool = False,
 ) -> pl.DataFrame:
     """Stack multiple TDT sessions into one multi-recording dataframe.
@@ -376,6 +409,12 @@ def create_master_df(
         session is averaged into bins of width ``1 / sample_rate``. ``time``
         is the mean time of the samples in the bin, and each note is snapped
         to the nearest output sample. Omit to keep the acquisition rate.
+    n_workers:
+        How many sessions to load at once. ``1`` (default) reads one file
+        at a time. Above 1, a thread pool reads several tanks at once and
+        the result stays in ``data_files`` order. Threads fit this work
+        because the tank read is mostly file I/O. ``debug=True`` prints
+        from different files can interleave.
     debug:
         If True, print each file name and its session shape while loading.
 
@@ -385,27 +424,25 @@ def create_master_df(
         Vertical concat of all session dataframes (same schema as
         ``create_session_df``).
     """
-    df_list = []
-    for file in data_files:
-        if debug:
-            print(file.name)
+    if n_workers < 1:
+        raise ValueError(f"n_workers must be at least 1, got {n_workers}")
 
-        _data = create_session_df(file, metadata_fields, isos=isos, gcamp=gcamp)
+    def load(file: Path) -> pl.DataFrame:
+        return _load_session_frame(
+            file,
+            metadata_fields,
+            isos,
+            gcamp,
+            experiment_length,
+            sample_rate,
+            debug,
+        )
 
-        if experiment_length is not None:
-            _data = _data.filter(pl.col("duration") <= experiment_length)
-
-        if sample_rate is not None:
-            try:
-                _data = _downsample_to_sample_rate(_data, sample_rate)
-            except ValueError as exc:
-                raise ValueError(f"{file.name}: {exc}") from exc
-
-        if debug:
-            print(f"Shape: {_data.shape}")
-            print(f"Columns: {_data.columns}")
-
-        df_list.append(_data)
+    if n_workers == 1 or len(data_files) < 2:
+        df_list = [load(file) for file in data_files]
+    else:
+        with ThreadPoolExecutor(max_workers=min(n_workers, len(data_files))) as pool:
+            df_list = list(pool.map(load, data_files))
 
     master_df = pl.concat(df_list, how="vertical")
 
